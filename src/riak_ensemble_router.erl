@@ -80,7 +80,8 @@ sync_send_event(_Node, Target, _Event, infinity) when not is_pid(Target) ->
     %% TODO: Consider handling this case
     throw("infinity timeout not currently safe for non-pid target");
 sync_send_event(Node, Target, Event, Timeout) ->
-    Ref = make_ref(),
+    % lager:info("sync_send_event, node: ~p, target: ~p, event: ~p, timeout: ~p", [Node, Target, Event, Timeout]),
+    Ref = unique_reference,
     spawn_link(?MODULE, sync_proxy, [self(), Ref, Node, Target, Event, Timeout]),
     receive
         {Ref, nack} ->
@@ -145,6 +146,7 @@ cast(Node, Ensemble, Msg) ->
     end.
 
 noconnect_cast(Dest, Msg) ->
+    lager:info("destination: ~p, message: ~p", [Dest, Msg]),
     case catch erlang:send(Dest, {'$gen_cast', Msg}, [noconnect]) of
 	noconnect ->
             spawn(fun() ->
@@ -218,15 +220,20 @@ code_change(_OldVsn, State, _Extra) ->
 
 -spec ensemble_cast(ensemble_id(), msg()) -> error | ok.
 ensemble_cast(Ensemble, Msg) ->
+    % lager:info("ensemble: ~p, message: ~p", [Ensemble, Msg]),
+
     case riak_ensemble_manager:get_leader(Ensemble) of
         {_, Node}=Leader ->
+            % lager:info("message: ~p, leader: ~p", [Msg, Leader]),
             %% io:format("L: ~p~n", [Leader]),
             if Node =:= node() ->
+                    % lager:info("message: ~p, leader is local", [Msg]),
                     Pid = riak_ensemble_manager:get_peer_pid(Ensemble, Leader),
                     %% io:format("Sending to ~p~n", [Pid]),
                     handle_ensemble_cast(Msg, Pid),
                     ok;
                true ->
+                    % lager:info("message: ~p, leader is NOT local", [Msg]),
                     riak_ensemble_router:cast(Node, Ensemble, Msg),
                     ok
             end;
@@ -239,6 +246,7 @@ handle_ensemble_cast({sync_send_event, From, Ref, Event, Timeout}, Pid) ->
     spawn(fun() ->
                   try
                       Result = gen_fsm_compat:sync_send_event(Pid, Event, Timeout),
+                    %   lager:info("event: ~p, result: ~p", [Event, Result]),
                       From ! {Ref, Result}
                   catch
                       _:_ ->

@@ -131,14 +131,26 @@ maybe_send_request(_Id, {PeerId, PeerPid}, ReqId, Event) ->
 
 -spec send_request({peer_id(), maybe_pid()}, reqid(), msg()) -> ok.
 send_request({PeerId, PeerPid}, ReqId, Event) ->
+    % lager:info("origin: ~p, peer_id: ~p, peer_pid: ~p, event: ~p", [node(), PeerId, PeerPid, Event]),
+
     case PeerPid of
         undefined ->
             ?OUT("~p: Sending offline nack for ~p~n", [self(), PeerId]),
+            % lager:info("~p: peer_id: ~p is offline for event: ~p, nack.", [self(), PeerId, Event]),
+
             From = make_from(self(), ReqId),
             reply(From, PeerId, nack);
         _ ->
             ?OUT("~p: Sending to ~p: ~p~n", [self(), PeerId, Event]),
-            gen_fsm_compat:send_event(PeerPid, Event)
+            % lager:info("~p: sending to peer_pid: ~p, peer_id: ~p, event: ~p~n", [self(), PeerPid, PeerId, Event]),
+
+            case is_partisan_forwardable({send, PeerId, PeerPid, Event}) of 
+                true ->
+                    {_Ensemble, Node} = PeerId,
+                    partisan_pluggable_peer_service_manager:forward_message(Node, undefined, PeerPid, {'$gen_event', Event});
+                false ->
+                    gen_fsm_compat:send_event(PeerPid, Event)
+            end
     end.
 
 %%%===================================================================
@@ -179,7 +191,14 @@ send_cast({_PeerId, PeerPid}, Event) ->
 
 -spec reply(msg_from(), peer_id(), any()) -> ok.
 reply({riak_ensemble_msg, Sender, ReqId}, Id, Reply) ->
-    gen_fsm_compat:send_all_state_event(Sender, {reply, ReqId, Id, Reply}).
+    % lager:info("node: ~p, sending reply: ~p, sender: ~p, req_id: ~p, id: ~p", [node(), Reply, Sender, ReqId, Id]),
+
+    case is_partisan_forwardable({reply, Sender, Reply}) of 
+        true ->
+            partisan_pluggable_peer_service_manager:forward_message(Sender, {'$gen_all_state_event', {reply, ReqId, Id, Reply}});
+        false ->
+            gen_fsm_compat:send_all_state_event(Sender, {reply, ReqId, Id, Reply})
+    end.
 
 %%%===================================================================
 
@@ -196,6 +215,9 @@ blocking_send_all(Msg, Id, Peers, Views, Required) when Required =/= undefined -
 -spec blocking_send_all(msg(), peer_id(), peer_pids(), views(),
                         required(), extra_check()) -> {future(), msg_state()}.
 blocking_send_all(Msg, Id, Peers, Views, Required, Extra) when Required =/= undefined ->
+    % lager:info("msg: ~p, id: ~p, peers: ~p, views: ~p, required: ~p, extra: ~p", 
+    %            [Msg, Id, Peers, Views, Required, Extra]),
+
     ?OUT("~p: blocking_send_all to ~p: ~p~n", [Id, Peers, Msg]),
     MsgState = #msgstate{awaiting=undefined, timer=undefined, replies=[],
                          views=Views, id=Id, required=Required},
@@ -211,7 +233,15 @@ blocking_send_all(Msg, Id, Peers, Views, Required, Extra) when Required =/= unde
 
 -spec collector(msg(), peer_pids(), extra_check(), msg_state()) -> ok.
 collector(Msg, Peers, Extra, #msgstate{id=Id, views=Views, required=Required}) ->
-    {ReqId, Request} = make_request(Msg),
+    {ReqId, Request} = case is_partisan_forwardable({collector, Msg}) of 
+        true ->
+            make_partisan_request(Msg);
+        false ->
+            make_request(Msg)
+    end,
+
+    % lager:info("msg: ~p req_id: ~p request: ~p", [Msg, ReqId, Request]),
+
     _ = [maybe_send_request(Id, Peer, ReqId, Request) || Peer={PeerId,_} <- Peers,
                                                          PeerId =/= Id],
     collect_replies(#collect{replies=[],
@@ -226,10 +256,14 @@ collector(Msg, Peers, Extra, #msgstate{id=Id, views=Views, required=Required}) -
 collect_replies(Collect=#collect{replies=Replies, reqid=ReqId}) ->
     receive
         {'$gen_all_state_event', Event} ->
+            % lager:info("gen_all_state_event: ~p", [Event]),
+
             {reply, ReqId, Peer, Reply} = Event,
             Replies2 = [{Peer, Reply}|Replies],
             check_enough(Collect#collect{replies=Replies2});
         {waiting, From, Ref} when is_pid(From), is_reference(Ref) ->
+            % lager:info("waiting, from: ~p ref: ~p", [From, Ref]),
+
             Parent = {From, Ref},
             check_enough(Collect#collect{parent=Parent})
     after ?ENSEMBLE_TICK ->
@@ -428,9 +462,22 @@ find_valid(Replies) ->
 
 %%%===================================================================
 
+make_partisan_request(Msg) ->
+    % ReqId = make_ref(),
+    ReqId = unique_reference,
+    From = make_from(partisan_util:pid(self()), ReqId),
+    Request = if is_tuple(Msg) ->
+                      erlang:append_element(Msg, From);
+                 true ->
+                      {Msg, From}
+              end,
+    {ReqId, Request}.
+
+
 -spec make_request(msg()) -> {reqid(), tuple()}.
 make_request(Msg) ->
-    ReqId = make_ref(),
+    % ReqId = make_ref(),
+    ReqId = unique_reference,
     From = make_from(self(), ReqId),
     Request = if is_tuple(Msg) ->
                       erlang:append_element(Msg, From);
@@ -461,3 +508,76 @@ cancel_timer(Timer) ->
         _ ->
             ok
     end.
+
+is_partisan_forwardable({reply, Sender, Reply}) ->
+    case Sender of 
+        Sender when is_pid(Sender) ->
+            % Node = node(Sender),
+            % lager:info("replying to process: ~p, node: ~p", [Sender, Node]),
+
+            case Reply of 
+                Reply when is_tuple(Reply) ->
+                    case element(1, Reply) of 
+                        obj ->
+                            case element(4, Reply) of 
+                                cluster_state ->
+                                    % lager:info("replying to process, protocol message: ~p", [Reply]),
+                                    false;
+                                _ ->
+                                    % lager:info("partisan, sending to sender: ~p", [Sender]),
+                                    true
+                            end;
+                        Other ->
+                            % lager:info("replying to process, protocol message: ~p", [Other]),
+                            false
+                    end;
+                Reply ->
+                    % lager:info("replying to process, non-tuple protocol message: ~p", [Reply]),
+                    false
+            end;
+        {partisan_remote_reference, _, _} ->
+            % lager:info("partisan, sending to remote reference sender: ~p", [Sender]),
+            true
+    end;
+is_partisan_forwardable({send, PeerId, PeerPid, Event}) ->
+    case PeerId of 
+        {_Ensemble, Node} ->
+            case element(1, Event) of 
+                put ->
+                    case element(2, Event) of 
+                        cluster_state ->
+                            % lager:info("cluster_state message bypassing partisan", []),
+                            false;
+                        _ ->
+                            true
+                    end;
+                Other ->
+                    % lager:info("protocol message bypassing partisan: ~p", [Other]),
+                    false
+            end;
+        Other ->
+            % lager:info("can't partisan forward for unknown node: ~p", [Other]),
+            false
+    end;
+is_partisan_forwardable({collector, Msg}) ->
+    case Msg of 
+        Msg when is_tuple(Msg) ->
+            case element(1, Msg) of 
+                put ->
+                    case element(2, Msg) of 
+                        cluster_state ->
+                            % lager:info("cluster_state message bypassing partisan", []),
+                            false;
+                        _ ->
+                            true
+                    end;
+                _ ->
+                    false
+            end;
+        Msg ->
+            false
+    end;
+is_partisan_forwardable(Other) ->
+    false.
+% is_partisan_forwardable(Other) ->
+%     true.

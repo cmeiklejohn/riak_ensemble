@@ -178,6 +178,7 @@ update_members(Pid, Changes, Timeout) when is_pid(Pid) ->
 
 -spec check_quorum(ensemble_id(), timeout()) -> ok | timeout.
 check_quorum(Ensemble, Timeout) ->
+    lager:info("check quorum for ensemble ~p called with timeout ~p", [Ensemble, Timeout]),
     riak_ensemble_router:sync_send_event(node(), Ensemble, check_quorum, Timeout).
 
 -spec count_quorum(ensemble_id(), timeout()) -> integer() | timeout.
@@ -286,9 +287,12 @@ do_kput_once(Obj, _NextSeq, State, [New]) ->
 
 -spec kover(node(), target(), key(), obj(), timeout()) -> std_reply().
 kover(Node, Target, Key, New, Timeout) ->
+    lager:info("kover called with node: ~p, target: ~p, key: ~p, new: ~p", [Node, Target, Key, New]),
+
     Result = riak_ensemble_router:sync_send_event(Node, Target,
                                                   {overwrite, Key, New}, Timeout),
     ?OUT("kover(~p): ~p~n", [Key, Result]),
+    lager:info("kover(~p): ~p~n", [Key, Result]),
     Result.
 
 -spec kmodify(node(), target(), key(), modify_fun(), term(), timeout()) -> std_reply().
@@ -369,6 +373,8 @@ probe(init, State) ->
             {next_state, probe, State3}
     end;
 probe({quorum_met, Replies}, State=#state{fact=Fact, abandoned=Abandoned}) ->
+    lager:info("replies are: ~p", [Replies]),
+    lager:info("fact is: ~p", [Fact]),
     Latest = latest_fact(Replies, Fact),
     Existing = existing_leader(Replies, Abandoned, Latest),
     State2 = State#state{fact=Latest,
@@ -660,6 +666,8 @@ leading({update_members, Changes}, From, State=#state{fact=Fact,
         {[], NewView} ->
             Views2 = [NewView|Views],
             NewFact = change_pending(Views2, State),
+            lager:info("updating members, new view: ~p", [NewView]),
+
             case try_commit(NewFact, State) of
                 {ok, State2} ->
                     {reply, ok, leading, State2};
@@ -671,6 +679,8 @@ leading({update_members, Changes}, From, State=#state{fact=Fact,
             {reply, {error, Errors}, leading, State}
     end;
 leading(check_quorum, From, State) ->
+    lager:info("checking quorum", []),
+
     case try_commit(State#state.fact, State) of
         {ok, State2} ->
             {reply, ok, leading, State2};
@@ -761,6 +771,7 @@ transition(State=#state{id=Id, fact=Fact}) ->
     ViewVsn = {Fact#fact.epoch, Fact#fact.seq},
     PendVsn = Fact#fact.pend_vsn,
     NewFact = Fact#fact{views=[Latest], view_vsn=ViewVsn, commit_vsn=PendVsn},
+    lager:info("transition", []),
     case try_commit(NewFact, State) of
         {ok, State3} ->
             case lists:member(Id, Latest) of
@@ -775,15 +786,19 @@ transition(State=#state{id=Id, fact=Fact}) ->
 
 -spec try_commit(fact(), state()) -> {failed, state()} | {ok, state()}.
 try_commit(NewFact0, State) ->
+    Epoch = epoch(State),
     Views = views(State),
     NewFact = increment_sequence(NewFact0),
+    lager:info("incrementing sequence number for commit.  current epoch: ~p, new_fact: ~p", [Epoch, NewFact]),
     State2 = local_commit(NewFact, State),
     {Future, State3} = blocking_send_all({commit, NewFact}, State2),
     case wait_for_quorum(Future) of
         {quorum_met, _Replies} ->
+            lager:info("quroum met", []),
             State4 = State3#state{last_views=Views},
             {ok, State4};
         {timeout, _Replies} ->
+            lager:info("timeout, only ~p replies", [length(_Replies)]),
             {failed, set_leader(undefined, State3)}
     end.
 
@@ -886,6 +901,7 @@ increment_epoch(State=#state{fact=Fact}) ->
 
 -spec increment_sequence(fact()) -> fact().
 increment_sequence(Fact=#fact{seq=Seq}) ->
+    lager:info("incrementing sequence to: ~p", [Seq + 1]),
     Fact#fact{seq=Seq+1}.
 
 -spec local_commit(fact(), state()) -> state().
@@ -1115,11 +1131,14 @@ maybe_ping(State=#state{id=Id}) ->
 -spec maybe_change_views(state()) -> {ok|failed|changed, state()}.
 maybe_change_views(State=#state{ensemble=Ensemble, fact=Fact}) ->
     PendVsn = Fact#fact.pend_vsn,
+    lager:info("maybe_change_views, pending vsn: ~p", [PendVsn]),
     case riak_ensemble_manager:get_pending(Ensemble) of
         {_, []} ->
             {ok, State};
         {Vsn, Views}
           when (PendVsn =:= undefined) orelse (Vsn > PendVsn) ->
+            lager:info("view change pending, vsn: ~p, views: ~p", [Vsn, Views]),
+
             ViewVsn = {Fact#fact.epoch, Fact#fact.seq},
             NewFact = Fact#fact{views=Views, pend_vsn=Vsn, view_vsn=ViewVsn},
             pause_workers(State),
@@ -1138,6 +1157,7 @@ maybe_change_views(State=#state{ensemble=Ensemble, fact=Fact}) ->
 maybe_clear_pending(State=#state{ensemble=Ensemble, fact=Fact}) ->
     #fact{pending=Pending, pend_vsn=PendVsn,
           commit_vsn=CommitVsn, views=Views} = Fact,
+    lager:info("maybe_clear_pending, pending: ~p", [Pending]),
     case Pending of
         {_, []} ->
             {ok, State};
@@ -1198,6 +1218,7 @@ maybe_async_update(Ensemble, Id, Views, Vsn, State=#state{async=Async}) ->
 
 -spec maybe_transition(state()) -> {ok|failed|shutdown, state()}.
 maybe_transition(State=#state{fact=Fact}) ->
+    lager:info("maybe_transition", []),
     Result = case should_transition(State) of
                  true ->
                      transition(State);
@@ -1291,6 +1312,7 @@ leading_kv({overwrite, _Key, _Val}, From, State=#state{tree_ready=false}) ->
     fail_request(From, State);
 leading_kv({overwrite, Key, Val}, From, State) ->
     Self = self(),
+    lager:info("into leading_kv message handler for key: ~p value: ~p, from: ~p, self: ~p", [Key, Val, From, Self]),
     async(Key, State, fun() -> do_overwrite_fsm(Key, Val, From, Self, State) end),
     {next_state, leading, State};
 leading_kv(_, _From, _State) ->
@@ -1319,6 +1341,8 @@ following_kv({get, Key, Peer, Epoch, From}, State) ->
             {next_state, following, State}
     end;
 following_kv({put, Key, Obj, Peer, Epoch, From}, State) ->
+    % lager:info("following_kv received put, key: ~p, obj: ~p, from: ~p, peer: ~p, epoch: ~p", [Key, Obj, From, Peer, Epoch]),
+
     case valid_request(Peer, Epoch, State) of
         true ->
             State2 = do_local_put(From, Key, Obj, State),
@@ -1349,7 +1373,8 @@ following_kv({get, _Key, _Opts}=Msg, From, State) ->
     forward(Msg, From, State);
 following_kv({put, _Key, _Fun, _Args}=Msg, From, State) ->
     forward(Msg, From, State);
-following_kv({overwrite, _Key, _Val}=Msg, From, State) ->
+following_kv({overwrite, Key, Val}=Msg, From, State) ->
+    lager:info("into following_kv message handler for key: ~p value: ~p", [Key, Val]),
     forward(Msg, From, State);
 following_kv(_, _From, _State) ->
     false.
@@ -1419,6 +1444,7 @@ do_overwrite_fsm(Key, Val, From, Self, State0=#state{ets=ETS}) ->
     State = State0#state{self=Self},
     Epoch = epoch(State),
     Seq = obj_sequence(ETS, Epoch),
+    lager:info("starting overwrite_fsm for key: ~p val: ~p sequence: ~p", [Key, Val, Seq]),
     Obj = new_obj(Epoch, Seq, Key, Val, State),
     case put_obj(Key, Obj, State) of
         {ok, Result, _State2} ->
@@ -1783,6 +1809,7 @@ obj_sequence(ETS, Epoch) ->
     try
         Seq = ets:update_counter(ETS, seq, 0),
         ObjSeq = ets:update_counter(ETS, {obj_seq, Epoch}, 1),
+        lager:info("got sequence number, seq: ~p obj_seq: ~p", [Seq, ObjSeq]),
         Seq + ObjSeq
     catch
         _:_ ->
@@ -1994,6 +2021,7 @@ blocking_send_all(Msg, Peers, Required, State) ->
       Extra  :: riak_ensemble_msg:extra_check(),
       Result :: {riak_ensemble_msg:future(), state()}.
 blocking_send_all(Msg, Peers, Required, Extra, State=#state{id=Id}) ->
+    % lager:info("msg: ~p, peers: ~p, required: ~p, extra: ~p", [Msg, Peers, Required, Extra]),
     Views = views(State),
     {Future, Awaiting} = riak_ensemble_msg:blocking_send_all(Msg, Id, Peers, Views, Required, Extra),
     State2 = State#state{awaiting=Awaiting},
@@ -2133,6 +2161,7 @@ mod_get(Key, From, State=#state{mod=Mod, modstate=ModState, id=Id}) ->
     State#state{modstate=ModState2}.
 
 mod_put(Key, Obj, From, State=#state{mod=Mod, modstate=ModState, id=Id}) ->
+    % lager:info("mod_put put occuring for from: ~p, mod: ~p, key: ~p, obj: ~p", [From, Mod, Key, Obj]),
     ModState2 = Mod:put(Key, Obj, {From, Id}, ModState),
     State#state{modstate=ModState2}.
 
